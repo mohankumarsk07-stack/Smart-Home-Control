@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Smart Home Control</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;padding:20px;background:#101827;color:#f1f5f9;font-family:Arial,sans-serif}
+main{max-width:850px;margin:auto}
+h1{text-align:center}
+.panel,.room{background:#1b2739;border:1px solid #35445b;border-radius:14px;padding:18px;margin:15px 0}
+input{width:100%;padding:12px;margin:7px 0;background:#0d1726;color:white;border:1px solid #506078;border-radius:8px}
+button{padding:11px 14px;margin:5px 3px 5px 0;border:0;border-radius:8px;font-weight:bold;cursor:pointer}
+button:disabled{opacity:.55;cursor:wait}
+.on{background:#28c990;color:#052b1e}
+.off{background:#ff7078;color:#38070a}
+.other{background:#42536c;color:white}
+.voice{background:#b4a0ff;color:#211344}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}
+.status{display:inline-block;padding:7px 12px;border-radius:20px;background:#42536c;margin:8px 0}
+.active{background:#126448;color:#b2ffe0}
+.inactive{background:#672e36;color:#ffd0d3}
+small{color:#b7c4d8;line-height:1.5}
+#message,#heard{white-space:pre-wrap;overflow-wrap:anywhere}
+@media(max-width:420px){body{padding:10px}.panel,.room{padding:14px}}
+</style>
+</head>
+<body>
+<main>
+  <h1>🏠 Smart Home Automation</h1>
+  <p style="text-align:center">Four-room control using Blynk Cloud and voice commands</p>
+
+  <section class="panel">
+    <h3>Blynk Cloud Connection</h3>
+    <label for="token">Blynk device authentication token</label>
+    <input id="token" type="password" autocomplete="off" placeholder="Enter your Blynk token">
+    <button class="on" onclick="connect()">Connect</button>
+    <button class="other" onclick="disconnect()">Disconnect</button>
+    <p id="connection">Disconnected</p>
+    <small>For a public website, do not embed your token in the HTML. Direct browser requests may also be blocked by Blynk CORS policy.</small>
+  </section>
+
+  <section class="panel">
+    <h3>All Rooms</h3>
+    <button class="on" onclick="allRooms(true)">ALL ON</button>
+    <button class="off" onclick="allRooms(false)">ALL OFF</button>
+    <button class="other" onclick="refreshStatus()">Refresh Status</button>
+    <button class="voice" id="micButton" onclick="startVoice()">🎙 Start Voice Control</button>
+    <button class="other" onclick="stopVoice()">Stop Voice</button>
+    <p><small>Examples: “turn on room one”, “first light start”, “switch off room two”, “all lights off”, “status”.</small></p>
+    <p id="heard">Recognized words will appear here.</p>
+  </section>
+
+  <div class="grid">
+    <div class="room"><h3>💡 Room 1</h3><span class="status" id="s0">Unknown</span><br>
+      <button class="on" onclick="setRoom(0,true)">ON</button>
+      <button class="off" onclick="setRoom(0,false)">OFF</button></div>
+    <div class="room"><h3>💡 Room 2</h3><span class="status" id="s1">Unknown</span><br>
+      <button class="on" onclick="setRoom(1,true)">ON</button>
+      <button class="off" onclick="setRoom(1,false)">OFF</button></div>
+    <div class="room"><h3>💡 Room 3</h3><span class="status" id="s2">Unknown</span><br>
+      <button class="on" onclick="setRoom(2,true)">ON</button>
+      <button class="off" onclick="setRoom(2,false)">OFF</button></div>
+    <div class="room"><h3>💡 Room 4</h3><span class="status" id="s3">Unknown</span><br>
+      <button class="on" onclick="setRoom(3,true)">ON</button>
+      <button class="off" onclick="setRoom(3,false)">OFF</button></div>
+  </div>
+
+  <section class="panel">
+    <h3>Activity</h3>
+    <p id="message">Enter your Blynk token and connect.</p>
+  </section>
+</main>
+
+<script>
+const BLYNK_API = "https://blynk.cloud/external/api";
+let token = "";
+let poller = null;
+let recognition = null;
+let listening = false;
+let busy = false;
+
+function log(message) {
+  document.getElementById("message").textContent =
+    new Date().toLocaleTimeString() + " — " + message;
+}
+function showMessage(message) { log(message); }
+function setConnection(message) {
+  document.getElementById("connection").textContent = message;
+}
+
+function makeApiUrl(endpoint, params = {}) {
+  const url = new URL(BLYNK_API + endpoint);
+  url.searchParams.set("token", token);
+  for (const [key, value] of Object.entries(params)) {
+    url.searchParams.set(key, String(value));
+  }
+  return url;
+}
+
+async function requestBlynk(endpoint, params = {}) {
+  if (!token) throw new Error("Connect to Blynk first.");
+  const response = await fetch(makeApiUrl(endpoint, params), {
+    method: "GET",
+    cache: "no-store"
+  });
+  const body = (await response.text()).trim();
+  if (!response.ok || /invalid token|not authorized|error/i.test(body)) {
+    throw new Error("Blynk API error: " + (body || response.status));
+  }
+  return body;
+}
+
+async function connect() {
+  const entered = document.getElementById("token").value.trim();
+  if (!entered) return log("Please enter your Blynk token.");
+  token = entered;
+  try {
+    await refreshStatus();
+    setConnection("Connected to Blynk Cloud");
+    log("Connected successfully.");
+    if (poller) clearInterval(poller);
+    poller = setInterval(() => {
+      refreshStatus().catch(error => {
+        setConnection("Connection issue");
+        log("Status refresh failed: " + error.message);
+      });
+    }, 5000);
+  } catch (error) {
+    token = "";
+    setConnection("Connection failed");
+    log(error.message + ". Check the token, datastreams, and browser CORS.");
+  }
+}
+
+function disconnect() {
+  token = "";
+  document.getElementById("token").value = "";
+  if (poller) clearInterval(poller);
+  poller = null;
+  stopVoice();
+  setConnection("Disconnected");
+  log("Disconnected from Blynk.");
+}
+
+async function readPin(roomIndex) {
+  const value = await requestBlynk("/get", {["V" + roomIndex]: ""});
+  const normalized = value.replace(/[\[\]"']/g, "").trim().toLowerCase();
+  if (normalized === "1" || normalized === "true") return true;
+  if (normalized === "0" || normalized === "false") return false;
+  throw new Error("Unexpected V" + roomIndex + " value: " + value);
+}
+
+function renderRoom(roomIndex, isOn) {
+  const element = document.getElementById("s" + roomIndex);
+  element.textContent = isOn ? "ON" : "OFF";
+  element.className = "status " + (isOn ? "active" : "inactive");
+}
+
+async function refreshStatus() {
+  if (!token) throw new Error("Connect to Blynk first.");
+  const states = await Promise.all([0, 1, 2, 3].map(readPin));
+  states.forEach((state, index) => renderRoom(index, state));
+  setConnection("Connected • updated " + new Date().toLocaleTimeString());
+  return states;
+}
+
+async function writePin(roomIndex, isOn) {
+  await requestBlynk("/update", {["V" + roomIndex]: isOn ? 1 : 0});
+}
+
+async function setRoom(roomIndex, isOn) {
+  if (!token) return log("Connect to Blynk first.");
+  if (busy) return log("Please wait for the current command to finish.");
+  busy = true;
+  try {
+    await writePin(roomIndex, isOn);
+    await refreshStatus();
+    log("Room " + (roomIndex + 1) + " command sent: " + (isOn ? "ON" : "OFF"));
+  } catch (error) {
+    log("Room command failed: " + error.message);
+  } finally {
+    busy = false;
+  }
+}
+
+async function allRooms(isOn) {
+  if (!token) return log("Connect to Blynk first.");
+  if (busy) return log("Please wait for the current command to finish.");
+  busy = true;
+  try {
+    for (let roomIndex = 0; roomIndex < 4; roomIndex++) {
+      await writePin(roomIndex, isOn);
+    }
+    await refreshStatus();
+    log("All rooms commanded " + (isOn ? "ON" : "OFF") + ".");
+  } catch (error) {
+    log("All-room command failed: " + error.message);
+  } finally {
+    busy = false;
+  }
+}
+
+/* Voice recognition: show interim words and inspect alternate transcripts. */
+function startVoice() {
+  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SpeechRecognition) {
+    showMessage("Voice recognition is not supported in this browser. Try Chrome.");
+    return;
+  }
+  if (listening) {
+    stopVoice();
+    return;
+  }
+
+  recognition = new SpeechRecognition();
+  recognition.lang = "en-IN";
+  recognition.continuous = true;
+  recognition.interimResults = true;
+  recognition.maxAlternatives = 5;
+
+  recognition.onstart = () => {
+    listening = true;
+    document.getElementById("micButton").textContent = "🔴 Listening — tap to stop";
+    showMessage("Listening. Say a room plus ON/OFF, or an all-room command.");
+  };
+
+  recognition.onresult = async event => {
+    let finalResult = null;
+    for (let i = event.resultIndex; i < event.results.length; i++) {
+      const result = event.results[i];
+      const alternatives = [];
+      for (let j = 0; j < result.length; j++) {
+        alternatives.push(result[j].transcript.trim());
+      }
+      if (result.isFinal) {
+        finalResult = alternatives;
+      } else if (alternatives[0]) {
+        document.getElementById("heard").textContent = "Hearing: " + alternatives[0];
+      }
+    }
+
+    if (finalResult && finalResult.length) {
+      document.getElementById("heard").textContent =
+        "You said: " + finalResult.join(" | ");
+      await processVoiceCommand(finalResult);
+    }
+  };
+
+  recognition.onerror = event => {
+    showMessage("Microphone error: " + event.error +
+      (event.error === "not-allowed" ? ". Allow microphone permission." : ""));
+  };
+
+  recognition.onend = () => {
+    if (listening && recognition) {
+      try { recognition.start(); }
+      catch (error) { showMessage("Microphone restarting. Tap Start if needed."); }
+    } else {
+      document.getElementById("micButton").textContent = "🎙 Start Voice Control";
+    }
+  };
+
+  try {
+    recognition.start();
+  } catch (error) {
+    showMessage("Could not start microphone: " + error.message);
+  }
+}
+
+function stopVoice() {
+  listening = false;
+  if (recognition) {
+    recognition.onend = null;
+    try { recognition.stop(); } catch (error) {}
+  }
+  recognition = null;
+  document.getElementById("micButton").textContent = "🎙 Start Voice Control";
+  showMessage("Voice control stopped.");
+}
+
+function normalizeSpeech(value) {
+  return value.toLowerCase()
+    .replace(/[.,!?;:]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function detectAction(text) {
+  // Match common forms such as "turn the light on", "switch off", "start".
+  const on = /\b(on|turn on|switch on|power on|start|open|activate|enable|light up)\b/.test(text);
+  const off = /\b(off|turn off|switch off|power off|stop|close|deactivate|disable|shut down)\b/.test(text);
+  if (on && !off) return true;
+  if (off && !on) return false;
+  return null;
+}
+
+function detectAllRooms(text) {
+  return /\b(all|everything|every|whole house|entire house)\b/.test(text) ||
+    /\ball lights?\b/.test(text) ||
+    /\ball rooms?\b/.test(text) ||
+    /\bevery light\b/.test(text) ||
+    /\bevery room\b/.test(text);
+}
+
+function detectRoom(text) {
+  // Order from more specific phrases to shorter number words.
+  const patterns = [
+    {index: 0, regex: /\b(room\s*(number\s*)?(one|1|first)|first\s*(room|light|switch)|light\s*(number\s*)?(one|1)|switch\s*(number\s*)?(one|1)|number\s*one)\b/},
+    {index: 1, regex: /\b(room\s*(number\s*)?(two|2|second)|second\s*(room|light|switch)|light\s*(number\s*)?(two|2)|switch\s*(number\s*)?(two|2)|number\s*two)\b/},
+    {index: 2, regex: /\b(room\s*(number\s*)?(three|3|third)|third\s*(room|light|switch)|light\s*(number\s*)?(three|3)|switch\s*(number\s*)?(three|3)|number\s*three)\b/},
+    {index: 3, regex: /\b(room\s*(number\s*)?(four|4|fourth)|fourth\s*(room|light|switch)|light\s*(number\s*)?(four|4)|switch\s*(number\s*)?(four|4)|number\s*four)\b/}
+  ];
+  for (const item of patterns) {
+    if (item.regex.test(text)) return item.index;
+  }
+
+  // Fallback for a room noun and a number in either order.
+  const numberMatch = text.match(/\b(one|1|first|two|2|second|three|3|third|four|4|fourth)\b/);
+  if (!numberMatch) return null;
+  if (!/\b(room|light|switch)\b/.test(text)) return null;
+  const word = numberMatch[1];
+  if (["one", "1", "first"].includes(word)) return 0;
+  if (["two", "2", "second"].includes(word)) return 1;
+  if (["three", "3", "third"].includes(word)) return 2;
+  return 3;
+}
+
+async function processVoiceCommand(transcripts) {
+  if (!token) return showMessage("Connect to Blynk first.");
+
+  // Use all speech alternatives; prefer a transcript that identifies an action.
+  const candidates = (Array.isArray(transcripts) ? transcripts : [transcripts])
+    .map(normalizeSpeech)
+    .filter(Boolean);
+
+  if (!candidates.length) return showMessage("No speech detected. Please try again.");
+
+  for (const text of candidates) {
+    console.log("Voice candidate:", text);
+
+    if (/\b(status|show status|check status|refresh status)\b/.test(text)) {
+      try {
+        const states = await refreshStatus();
+        log(states.map((state, i) => "Room " + (i + 1) + ": " + (state ? "ON" : "OFF")).join("\n"));
+      } catch (error) {
+        log("Status failed: " + error.message);
+      }
+      return;
+    }
+
+    const action = detectAction(text);
+    if (detectAllRooms(text)) {
+      if (action === true) return allRooms(true);
+      if (action === false) return allRooms(false);
+      continue;
+    }
+
+    const roomIndex = detectRoom(text);
+    if (roomIndex !== null && action !== null) {
+      return setRoom(roomIndex, action);
+    }
+  }
+
+  showMessage("Command not clear. Try: 'turn on room one', 'first light off', or 'all lights on'.");
+}
+
+setInterval(() => {
+  if (token && !busy) {
+    refreshStatus().catch(error => {
+      setConnection("Connection issue");
+      console.warn("Automatic status refresh:", error.message);
+    });
+  }
+}, 5000);
+</script>
+</body>
+</html>
